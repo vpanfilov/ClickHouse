@@ -181,11 +181,15 @@ public:
     ///
     /// Future should not be destroyed before the result is gotten.
 
+    std::future<ZooKeeperImpl::ZooKeeper::CreateResponse> asyncCreate(const std::string & path, const std::string & data, int32_t mode);
+
     std::future<ZooKeeperImpl::ZooKeeper::GetResponse> asyncGet(const std::string & path);
 
     std::future<ZooKeeperImpl::ZooKeeper::GetResponse> asyncTryGet(const std::string & path);
 
     std::future<ZooKeeperImpl::ZooKeeper::ExistsResponse> asyncExists(const std::string & path);
+
+    std::future<ZooKeeperImpl::ZooKeeper::SetResponse> asyncSet(const std::string & path, const std::string & data, int32_t version = -1);
 
     std::future<ZooKeeperImpl::ZooKeeper::ListResponse> asyncGetChildren(const std::string & path);
 
