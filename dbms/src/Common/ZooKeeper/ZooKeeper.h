@@ -259,6 +259,20 @@ public:
         return path;
     }
 
+    void remove()
+    {
+        try
+        {
+            zookeeper.tryRemove(path);
+            path.clear();
+        }
+        catch (...)
+        {
+            ProfileEvents::increment(ProfileEvents::CannotRemoveEphemeralNode);
+            throw;
+        }
+    }
+
     static Ptr create(const std::string & path, ZooKeeper & zookeeper, const std::string & data = "")
     {
         return std::make_shared<EphemeralNodeHolder>(path, zookeeper, true, false, data);
@@ -278,11 +292,10 @@ public:
     {
         try
         {
-            zookeeper.tryRemove(path);
+            remove();
         }
         catch (...)
         {
-            ProfileEvents::increment(ProfileEvents::CannotRemoveEphemeralNode);
             DB::tryLogCurrentException(__PRETTY_FUNCTION__);
         }
     }
