@@ -278,6 +278,7 @@ bool ReplicatedMergeTreeQueue::pullLogsToQueue(zkutil::ZooKeeperPtr zookeeper, z
     /// in the queue.
     /// With this we ensure that if you read the queue state Q1 and then the state of mutations M1,
     /// then Q1 "happened-before" M1.
+    /// TODO: notify merge_selecting_event if something loaded.
     updateMutations(zookeeper, nullptr);
 
     if (index_str.empty())
@@ -502,7 +503,7 @@ ReplicatedMergeTreeQueue::StringSet ReplicatedMergeTreeQueue::moveSiblingPartsFo
     Queue::iterator merge_entry;
     for (Queue::iterator it = queue.begin(); it != queue.end(); ++it)
     {
-        if ((*it)->type == LogEntry::MERGE_PARTS)
+        if ((*it)->type == LogEntry::MERGE_PARTS || (*it)->type == LogEntry::MUTATE_PART)
         {
             if (std::find((*it)->parts_to_merge.begin(), (*it)->parts_to_merge.end(), part_name)
                 != (*it)->parts_to_merge.end())
@@ -525,7 +526,7 @@ ReplicatedMergeTreeQueue::StringSet ReplicatedMergeTreeQueue::moveSiblingPartsFo
             if (it0 == merge_entry)
                 break;
 
-            if (((*it0)->type == LogEntry::MERGE_PARTS || (*it0)->type == LogEntry::GET_PART)
+            if (((*it0)->type == LogEntry::MERGE_PARTS || (*it0)->type == LogEntry::GET_PART || (*it0)->type == LogEntry::MUTATE_PART)
                 && parts_for_merge.count((*it0)->new_part_name))
             {
                 queue.splice(queue.end(), queue, it0, it);
@@ -537,7 +538,7 @@ ReplicatedMergeTreeQueue::StringSet ReplicatedMergeTreeQueue::moveSiblingPartsFo
 }
 
 
-void ReplicatedMergeTreeQueue::removeGetsAndMergesInRange(zkutil::ZooKeeperPtr zookeeper, const String & part_name)
+void ReplicatedMergeTreeQueue::removePartProducingOpsInRange(zkutil::ZooKeeperPtr zookeeper, const String & part_name)
 {
     Queue to_wait;
     size_t removed_entries = 0;
@@ -548,7 +549,7 @@ void ReplicatedMergeTreeQueue::removeGetsAndMergesInRange(zkutil::ZooKeeperPtr z
     std::unique_lock<std::mutex> lock(queue_mutex);
     for (Queue::iterator it = queue.begin(); it != queue.end();)
     {
-        if (((*it)->type == LogEntry::GET_PART || (*it)->type == LogEntry::MERGE_PARTS) &&
+        if (((*it)->type == LogEntry::GET_PART || (*it)->type == LogEntry::MERGE_PARTS || (*it)->type == LogEntry::MUTATE_PART) &&
             MergeTreePartInfo::contains(part_name, (*it)->new_part_name, format_version))
         {
             if ((*it)->currently_executing)
@@ -586,7 +587,10 @@ ReplicatedMergeTreeQueue::Queue ReplicatedMergeTreeQueue::getConflictsForClearCo
     {
         if (elem->currently_executing && elem->znode_name != entry.znode_name)
         {
-            if (elem->type == LogEntry::MERGE_PARTS || elem->type == LogEntry::GET_PART || elem->type == LogEntry::ATTACH_PART)
+            if (elem->type == LogEntry::MERGE_PARTS
+                || elem->type == LogEntry::GET_PART
+                || elem->type == LogEntry::MUTATE_PART
+                || elem->type == LogEntry::ATTACH_PART)
             {
                 if (MergeTreePartInfo::contains(entry.new_part_name, elem->new_part_name, format_version))
                     conflicts.emplace_back(elem);
@@ -686,7 +690,10 @@ bool ReplicatedMergeTreeQueue::shouldExecuteLogEntry(
     MergeTreeData & data,
     std::lock_guard<std::mutex> & queue_lock) const
 {
-    if (entry.type == LogEntry::MERGE_PARTS || entry.type == LogEntry::GET_PART || entry.type == LogEntry::ATTACH_PART)
+    if (entry.type == LogEntry::MERGE_PARTS
+        || entry.type == LogEntry::GET_PART
+        || entry.type == LogEntry::ATTACH_PART
+        || entry.type == LogEntry::MUTATE_PART)
     {
         if (!isNotCoveredByFuturePartsImpl(entry.new_part_name, out_postpone_reason, queue_lock))
         {
@@ -696,9 +703,9 @@ bool ReplicatedMergeTreeQueue::shouldExecuteLogEntry(
         }
     }
 
-    if (entry.type == LogEntry::MERGE_PARTS)
+    if (entry.type == LogEntry::MERGE_PARTS || entry.type == LogEntry::MUTATE_PART)
     {
-        /** If any of the required parts are now transferred or in merge process, wait for the end of this operation.
+        /** If any of the required parts are now fetched or in merge process, wait for the end of this operation.
           * Otherwise, even if all the necessary parts for the merge are not present, you should try to make a merge.
           * If any parts are missing, instead of merge, there will be an attempt to download a part.
           * Such a situation is possible if the receive of a part has failed, and it was moved to the end of the queue.
@@ -770,6 +777,7 @@ Int64 ReplicatedMergeTreeQueue::getCurrentMutationVersion(
     auto it = in_partition->second.upper_bound(data_version);
     if (it == in_partition->second.begin())
         return 0;
+
     --it;
     return it->first;
 }
@@ -916,9 +924,11 @@ ReplicatedMergeTreeQueue::Status ReplicatedMergeTreeQueue::getStatus() const
 
     res.inserts_in_queue = 0;
     res.merges_in_queue = 0;
+    res.mutations_in_queue = 0;
     res.queue_oldest_time = 0;
     res.inserts_oldest_time = 0;
     res.merges_oldest_time = 0;
+    res.mutations_oldest_time = 0;
 
     for (const LogEntryPtr & entry : queue)
     {
@@ -946,6 +956,17 @@ ReplicatedMergeTreeQueue::Status ReplicatedMergeTreeQueue::getStatus() const
                 res.oldest_part_to_merge_to = entry->new_part_name;
             }
         }
+
+        if (entry->type == LogEntry::MUTATE_PART)
+        {
+            ++res.mutations_in_queue;
+
+            if (entry->create_time && (!res.mutations_oldest_time || entry->create_time < res.mutations_oldest_time))
+            {
+                res.mutations_oldest_time = entry->create_time;
+                res.oldest_part_to_mutate_to = entry->new_part_name;
+            }
+        }
     }
 
     return res;
@@ -963,17 +984,17 @@ void ReplicatedMergeTreeQueue::getEntries(LogEntriesData & res) const
 }
 
 
-size_t ReplicatedMergeTreeQueue::countMerges() const
+size_t ReplicatedMergeTreeQueue::countMergesAndPartMutations() const
 {
-    size_t all_merges = 0;
+    size_t count = 0;
 
     std::lock_guard lock(queue_mutex);
 
     for (const auto & entry : queue)
-        if (entry->type == LogEntry::MERGE_PARTS)
-            ++all_merges;
+        if (entry->type == LogEntry::MERGE_PARTS || entry->type == LogEntry::MUTATE_PART)
+            ++count;
 
-    return all_merges;
+    return count;
 }
 
 
@@ -1197,6 +1218,31 @@ bool ReplicatedMergeTreeMergePredicate::operator()(
         }
     }
 
+    return true;
+}
+
+
+bool ReplicatedMergeTreeMergePredicate::canMutatePart(const MergeTreeData::DataPartPtr & part, Int64 & desired_mutation_version) const
+{
+    if (next_virtual_parts.getContainingPart(part->info) != part->name)
+        return false;
+
+    if (part->name == last_quorum_part
+        || part->name == inprogress_quorum_part)
+        return false;
+
+    std::lock_guard lock(queue.target_state_mutex);
+
+    auto in_partition = queue.mutations_by_partition.find(part->info.partition_id);
+    if (in_partition == queue.mutations_by_partition.end())
+        return false;
+
+    Int64 current_version = queue.getCurrentMutationVersion(part->info, lock);
+    Int64 desired_version = in_partition->second.rbegin()->first;
+    if (current_version >= desired_version)
+        return false;
+
+    desired_mutation_version = desired_version;
     return true;
 }
 
