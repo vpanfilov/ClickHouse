@@ -759,6 +759,22 @@ bool ReplicatedMergeTreeQueue::shouldExecuteLogEntry(
 }
 
 
+Int64 ReplicatedMergeTreeQueue::getCurrentMutationVersion(
+    const MergeTreePartInfo & part_info, std::lock_guard<std::mutex> & /* target_state_lock */) const
+{
+    auto in_partition = mutations_by_partition.find(part_info.partition_id);
+    if (in_partition == mutations_by_partition.end())
+        return 0;
+
+    Int64 data_version = part_info.version ? part_info.version : part_info.min_block;
+    auto it = in_partition->second.upper_bound(data_version);
+    if (it == in_partition->second.begin())
+        return 0;
+    --it;
+    return it->first;
+}
+
+
 ReplicatedMergeTreeQueue::CurrentlyExecuting::CurrentlyExecuting(ReplicatedMergeTreeQueue::LogEntryPtr & entry, ReplicatedMergeTreeQueue & queue)
     : entry(entry), queue(queue)
 {
@@ -1163,6 +1179,20 @@ bool ReplicatedMergeTreeMergePredicate::operator()(
                 *out_reason = "There are " + toString(covered.size()) + " parts (from " + covered.front()
                     + " to " + covered.back() + ") that are still not present on this replica between "
                     + left->name + " and " + right->name;
+            return false;
+        }
+    }
+
+    {
+        std::lock_guard target_state_lock(queue.target_state_mutex);
+
+        Int64 left_mutation = queue.getCurrentMutationVersion(left->info, target_state_lock);
+        Int64 right_mutation = queue.getCurrentMutationVersion(right->info, target_state_lock);
+        if (left_mutation != right_mutation)
+        {
+            if (out_reason)
+                *out_reason = "Current mutation versions of parts " + left->name + " and " + right->name + " differ: "
+                    + toString(left_mutation) + " and " + toString(right_mutation) + " respectively";
             return false;
         }
     }

@@ -116,6 +116,12 @@ private:
         MergeTreeDataMerger & merger, MergeTreeData & data,
         std::lock_guard<std::mutex> & queue_lock) const;
 
+    /// Return the version (block number) of the last mutation that we don't need to apply to the part
+    /// (either this mutation was already applied or the part was created after the mutation).
+    /// If there is no such mutation or it has already been executed and deleted, return 0.
+    /// Call under the target_state_mutex.
+    Int64 getCurrentMutationVersion(const MergeTreePartInfo & part_info, std::lock_guard<std::mutex> & /* target_state_lock */) const;
+
     /** Check that part isn't in currently generating parts and isn't covered by them.
       * Should be called under queue_mutex.
       */
