@@ -4,6 +4,7 @@
 #include <Storages/MergeTree/MergeTreeBlockOutputStream.h>
 #include <Storages/MergeTree/DiskSpaceMonitor.h>
 #include <Storages/MergeTree/MergeList.h>
+#include <Storages/MergeTree/MergeTreeMutation.h>
 #include <Databases/IDatabase.h>
 #include <Common/escapeForFileName.h>
 #include <Common/typeid_cast.h>
@@ -221,11 +222,21 @@ void StorageMergeTree::alter(
 }
 
 
-void StorageMergeTree::mutate(const MutationCommands & commands, const Context & /*context*/)
+void StorageMergeTree::mutate(const MutationCommands & commands, const Context & context)
 {
-    for (const auto & cmd : commands.commands)
+    UInt32 version = increment.get();
+    /// TODO: sync with merges.
+    MergeTreeMutation mutation(data, version, commands.commands);
+
+    MergeTreeData::DataPartsVector old_parts = data.getDataPartsVector();
+    for (const auto & old_part : old_parts)
     {
-        LOG_TRACE(log, "MUTATION type: " << cmd.type << " predicate: " << cmd.predicate);
+        if (old_part->info.min_block >= version || old_part->info.version >= version)
+            continue;
+
+        auto new_part = mutation.executeOnPart(old_part, context);
+        if (new_part)
+            data.renameTempPartAndReplace(new_part);
     }
 }
 
